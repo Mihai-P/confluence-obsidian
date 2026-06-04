@@ -14,14 +14,14 @@ Given a local tree of Markdown files mirroring a Confluence space:
 
 ```
 confluence/<SPACE>/
-├── index.md                 # space root
-├── 01-some-section/
-│   ├── index.md             # a Confluence page with children
-│   └── a-leaf-page.md       # a leaf Confluence page
-└── ...
+├── 01. Pipeline Architecture.md        # a leaf Confluence page
+├── 02. Tech Stack Boilerplate.md       # a page WITH children: its own content…
+├── 02. Tech Stack Boilerplate/         # …and its children in a sibling folder
+│   └── 02.5 Generated-site conversion spec.md
+└── attachments/<attachment_id>.<ext>
 ```
 
-…the skill walks the tree, compares each file against its live Confluence counterpart, and decides per page whether to **skip, push, pull, or flag a conflict**. Directory layout maps to Confluence parent/child page hierarchy: a folder's `index.md` is the parent of the pages beside it.
+…the skill walks the tree, compares each file against its live Confluence counterpart, and decides per page whether to **skip, push, pull, or flag a conflict**. Directory layout maps to Confluence parent/child hierarchy as **sibling folder notes**: a page with children is a `Title.md` file beside a `Title/` folder holding those children. (Chosen because the Atlassian MCP's own Markdown links are hierarchy-relative and already assume this layout — see `DESIGN.md`.)
 
 ## How it works
 
@@ -37,8 +37,8 @@ confluence:
   space_id: "262148"
   parent_id: "..."        # inferred from directory layout
   version: 5              # the remote version we last synced to
-  last_modified: "..."
-  body_sha: "<sha256>"    # hash of the body that matched `version`
+  last_synced: "..."
+  body_sha: "<sha256>"    # hash of the local markdown body that matched `version`
 ---
 ```
 
@@ -56,9 +56,9 @@ On each run, for every page the skill computes:
 | no  | yes | **pull** (overwrite local body) |
 | yes | yes | **conflict** — stop, show a diff, let you pick a side (never auto-merge) |
 
-New local files (`id: null`) are **created** in Confluence with the parent resolved from the folder structure; new remote pages with no local file are **pulled down** into the matching directory. After any write, the frontmatter watermark (`version`, `last_modified`, `body_sha`) is rewritten so the next run can tell exactly what moved.
+New local files (`id: null`) are **created** in Confluence with the parent resolved from the folder structure; new remote pages with no local file are **pulled down** into the matching directory. After any write, the frontmatter watermark (`version`, `last_synced`, `body_sha`) is rewritten so the next run can tell exactly what moved.
 
-Bodies are exchanged in Confluence **`storage` format** (canonical XHTML) so they round-trip losslessly.
+Bodies are exchanged as **Markdown** via the Atlassian MCP server's server-side conversion (`contentFormat: "markdown"`) — so the files on disk are real, Obsidian-native Markdown, not Confluence XHTML. On disk a page keeps its `# H1` and frontmatter and uses Obsidian-resolvable relative links; on push the skill strips the frontmatter and H1 and rewrites internal links to absolute Confluence page URLs.
 
 ### Modes
 
@@ -105,7 +105,7 @@ The skill is **manual-only** (`disable-model-invocation: true`) because it write
 
 ## Status & roadmap
 
-Today the skill syncs Confluence ↔ a local Markdown tree. Because that tree is just plain Markdown, it already drops into an **Obsidian** vault — the `confluence-obsidian` name points at where this is headed: making an Obsidian vault a first-class, comfortable home for Confluence content (link rewriting, attachments/images, and vault-friendly frontmatter are the natural next steps).
+The skill syncs Confluence ↔ a local, **Obsidian-native** Markdown tree (sibling folder notes, relative links, `# H1` titles), so the vault drops straight into **Obsidian**. The full design — Markdown-via-MCP, the sibling layout, the `version` + `body_sha` matrix, and link rewriting — lives in `DESIGN.md`. Still open: spot-checking how the MCP renders Confluence panels/expand/macros, and attachment (image/file) download-and-upload.
 
 ## License
 

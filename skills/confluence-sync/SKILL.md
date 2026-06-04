@@ -1,152 +1,200 @@
 ---
 name: confluence-sync
-description: Two-way sync between a local markdown mirror under confluence/<SPACE>/ and an Atlassian Confluence space, using the Atlassian MCP server directly. Invoke with /confluence-sync (manual-only — it writes to live Confluence) when you want to publish local edits, pull remote changes, check whether the local mirror is up to date, or see what changed. Walks the local tree, reads version + body_sha from each file's YAML frontmatter, fetches the live remote page via getConfluencePage, and decides per-page whether to skip, push, pull, or surface a conflict. Pushes via updateConfluencePage; creates new pages via createConfluencePage with the parent inferred from directory layout.
+description: Two-way sync between an Obsidian-native Markdown vault under confluence/<SPACE>/ and an Atlassian Confluence space, using the Atlassian MCP server's server-side Markdown conversion. Invoke with /confluence-sync (manual-only — it writes to live Confluence) to publish local edits, pull remote changes, check whether the local mirror is up to date, or see what changed. Reads/writes pages with contentFormat "markdown"; tracks each page with version + body_sha in YAML frontmatter and decides per-page whether to skip, push, pull, or surface a conflict. Stores pages as sibling folder notes (Title.md beside a Title/ folder of children); rewrites links to Obsidian relative form on pull and to absolute Confluence page URLs on push.
 disable-model-invocation: true
-allowed-tools: Read, Write, Edit, Glob, Bash(awk *), Bash(sha256sum *), Bash(diff *), Bash(mkdir *), mcp__claude_ai_Atlassian__getConfluencePage, mcp__claude_ai_Atlassian__updateConfluencePage, mcp__claude_ai_Atlassian__createConfluencePage, mcp__claude_ai_Atlassian__getPagesInConfluenceSpace, mcp__claude_ai_Atlassian__getConfluencePageDescendants
+allowed-tools: Read, Write, Edit, Glob, Bash(awk *), Bash(sha256sum *), Bash(diff *), Bash(mkdir *), Bash(mv *), mcp__claude_ai_Atlassian__getConfluencePage, mcp__claude_ai_Atlassian__updateConfluencePage, mcp__claude_ai_Atlassian__createConfluencePage, mcp__claude_ai_Atlassian__getPagesInConfluenceSpace, mcp__claude_ai_Atlassian__getConfluencePageDescendants, mcp__claude_ai_Atlassian__searchConfluenceUsingCql
 ---
 
 # confluence-sync
 
-Two-way sync between `confluence/<SPACE>/` and the Atlassian Confluence space, driven entirely by Atlassian MCP calls plus `Read` / `Edit` / `Write` on the local files. No helper scripts, no snapshot file, no batch importer — every operation hits the live Atlassian API through the MCP server.
+Two-way sync between an **Obsidian-native Markdown vault** under `confluence/<SPACE>/` and an Atlassian
+Confluence space. Every read and write goes through the Atlassian MCP server using its **server-side
+Markdown conversion** (`contentFormat: "markdown"`), plus `Read` / `Edit` / `Write` / `Glob` on the local
+files. No client-side format converter, no snapshot file, no batch importer.
+
+The full design rationale lives in `DESIGN.md` at the repo root. This file is the operational contract.
 
 ## Required reading
 
-- `confluence/README.md` — the round-trip contract: which frontmatter fields exist, what `confluence.id` is for.
-- The frontmatter at the top of any existing `.md` file under `confluence/SD/` — same shape applies to every page. This skill adds **one new field, `body_sha`**, on top of that shape.
+- `DESIGN.md` (repo root) — the why: layout, link model, sync matrix, fidelity notes.
+- The frontmatter at the top of any existing `.md` file under `confluence/<SPACE>/` — same shape applies to
+  every page.
 
 ## Reference files
 
-Detailed procedures live beside this file and load only when a sync needs them:
+Detailed procedures load on demand:
 
-- `references/new-pages.md` — read when the decision matrix produces a `CREATE_REMOTE` (local-only) or `CREATE_LOCAL` (remote-only) case.
-- `references/conflict-resolution.md` — read when a page lands in the `CONFLICT` bucket.
+- `references/new-pages.md` — when the matrix produces a `CREATE_REMOTE` (local-only) or `CREATE_LOCAL`
+  (remote-only) page.
+- `references/conflict-resolution.md` — when a page lands in the `CONFLICT` bucket.
+
+## Constants (this site)
+
+- cloudId: `xstep.atlassian.net` (the host works directly as cloudId).
+- Space `SD` → `space_id: 262148`, home page id `262260`. Other spaces: read from frontmatter.
+
+## On-disk layout — sibling folder notes
+
+A page with **both content and children** is a `.md` file beside a same-named folder of its children:
+
+```
+confluence/SD/
+├─ 02. Tech Stack Boilerplate.md       # the page's own content
+├─ 02. Tech Stack Boilerplate/         # its children, in a sibling folder
+│  └─ 02.5 Generated-site conversion spec.md
+├─ 01. Pipeline Architecture.md        # a leaf (no children)
+└─ attachments/<attachment_id>.<ext>
+```
+
+A leaf is just `Title.md`. When it gains its first child, create the sibling `Title/` folder and write the
+child inside — `Title.md` does not move. Filename = page title, illegal characters escaped; on a title
+collision in the same folder, suffix `--<id>`.
 
 ## State stored in frontmatter
 
-Every page's frontmatter carries the sync watermark:
-
 ```yaml
 ---
-title: "..."
+title: "01. Pipeline Architecture"
 confluence:
-  id: "262260"               # canonical id; null only for not-yet-pushed local pages
-  url: "https://xstep.atlassian.net/wiki/spaces/SD/pages/262260"
+  id: "917505"                       # canonical id; null only for not-yet-pushed local pages
+  url: "https://xstep.atlassian.net/wiki/spaces/SD/pages/917505"
   space_key: "SD"
   space_id: "262148"
-  parent_id: "..." | null    # null only for the space root
-  version: 5                 # remote version we last synced TO
-  last_modified: "..."       # remote last-modified at last sync
-  body_sha: "<sha256>"       # sha256 of the body bytes that matched `version`
+  parent_id: "262260" | null         # null only for the space root
+  version: 12                        # remote version we last synced TO
+  last_synced: "2026-06-04T10:22:00Z"
+  body_sha: "<sha256 of the local markdown body>"
 ---
 ```
 
-`version` + `body_sha` together describe the last known agreement between local and remote. They are how we tell who edited what since.
+`version` + `body_sha` describe the last known agreement: `version` is the authoritative remote-change
+signal, `body_sha` detects local edits. A file with no `body_sha` is **uninitialised** — on first sync take
+remote as authoritative (PULL), then write `body_sha`.
 
-Files predating this skill won't have `body_sha`. Treat a missing `body_sha` as "uninitialised" — on first sync, take the remote body as authoritative for that page (PULL), then write `body_sha` so subsequent runs can detect local edits.
+## Body rules — disk vs. Confluence
 
-## Decision matrix
+- **On disk:** keep the YAML frontmatter and the leading `# H1` (reads as the note title in Obsidian; it
+  equals `frontmatter.title`).
+- **On push:** strip the frontmatter **and** the leading `# H1` before sending — Confluence renders the
+  title itself, so a body H1 would duplicate it.
+- **On pull:** the MCP returns the body with its `# H1`; write it as-is, then add/update frontmatter.
 
-For each local `.md` file with a `confluence.id`, fetch the remote via `getConfluencePage(pageId, body-format=storage)` and compute three booleans:
-
-- `local_changed = sha256(local.body) !== local.frontmatter.body_sha`
-- `remote_changed = remote.version !== local.frontmatter.version`
-- `bodies_match = local.body === remote.body`
-
-Action:
-
-| local_changed | remote_changed | Action | What to do |
-| --- | --- | --- | --- |
-| no | no | **SKIP** | Nothing to do. |
-| yes | no | **PUSH** | `updateConfluencePage`; on success rewrite frontmatter `version`, `last_modified`, `body_sha`. |
-| no | yes | **PULL** | Overwrite local body with `remote.body`; rewrite frontmatter `version`, `last_modified`, `body_sha`. |
-| yes | yes | **CONFLICT** | Stop. Show the diff. Let the user pick a side; then PUSH or PULL accordingly. Don't auto-merge. |
-
-Also possible:
-
-- `local.id === null` → **CREATE_REMOTE** (see "New pages" below).
-- Remote page exists in space but no local file holds its id → **CREATE_LOCAL** (see "New pages").
-
-If `body_sha` is missing on the local file, set `local_changed = false` for the first sync only and apply a PULL; that initialises tracking.
+`body_sha` always hashes the **local** body — everything after the frontmatter, H1 included — so
+local-change detection is independent of push-time trimming.
 
 ## Computing the local body sha
 
-Read the file with `Read`, then split off the body (everything after the second `---` line). Hash with sha256.
-
-In Bash, the inline pipeline is:
+`Read` the file, split off the body (everything after the second `---`), hash with sha256. In Bash:
 
 ```bash
 awk 'fence==2 {print} /^---$/ && fence<2 {fence++}' <file> | sha256sum | awk '{print $1}'
 ```
 
-Use that exact incantation when you need a sha and don't have one in hand — the trailing newline behaviour of `awk` matches what `Edit`/`Write` produce, so a sha taken right after writing the file will match a sha taken before the next sync.
+Use that exact incantation so a sha taken right after a `Write` matches a sha taken before the next sync.
 
-## Body format
+## Format — Markdown via the MCP
 
-Use `body-format: storage` for both `getConfluencePage` and `updateConfluencePage`. Reasons:
+Use `contentFormat: "markdown"` for **both** `getConfluencePage` and `updateConfluencePage`. The MCP server
+does the Confluence↔Markdown conversion. `pageId` is a **string** — pass it quoted.
 
-- `storage` is the canonical Confluence XHTML — it round-trips losslessly.
-- `view` is rendered HTML — not pushable.
-- `atlas_doc_format` is JSON ADF — also round-trippable but more verbose; we don't need it.
+The MCP renders internal page links as hierarchy-relative paths (`./<ancestor>/<target>`, spaces as `+`, no
+extension, with `#anchors`). Because the layout is sibling, those paths line up with the files.
 
-Pick one and stick with it. If a page was pulled with `storage`, push it back with `storage`. Existing files under `confluence/SD/` already hold storage XHTML in the body section, so `storage` is the only safe choice for round-tripping current files.
+## Links — rewrite both directions
 
-If you discover a page in a different format (rare), pull it fresh first with `storage` before doing any other operation on it.
+Build an `id → { path, title }` map by scanning every file's frontmatter once per run. Then:
+
+- **On pull:** rewrite each MCP relative link `./A+B/C#anchor` → an Obsidian relative `.md` link: decode
+  `+`→space, append `.md`, resolve the target via the id↔path map. Keep `http(s)` and `#anchor` links as-is.
+- **On push:** rewrite each relative `.md` link to the **target's absolute Confluence URL**
+  (`confluence.url` from the target file's frontmatter). If the target has no id yet (unpublished), **drop
+  the link, keep the text**. Never send a relative `.md` link to Confluence — it breaks there.
+
+For new local pages that link to each other, push in **two passes**: (1) create all new pages to allocate
+ids, writing each id back to frontmatter; (2) re-resolve and rewrite cross-links.
+
+## Decision matrix
+
+For each local file with a `confluence.id`, fetch the remote with `contentFormat: "markdown"` and compute:
+
+- `local_changed  = sha256(local_body) != frontmatter.body_sha`
+- `remote_changed = remote.version != frontmatter.version`
+
+| local_changed | remote_changed | Action | What to do |
+| --- | --- | --- | --- |
+| no  | no  | **SKIP** | Nothing to do. |
+| yes | no  | **PUSH** | Strip frontmatter + H1, rewrite links → absolute, `updateConfluencePage`. On success write back `version` (from response), `last_synced`, `body_sha = sha256(local_body)`. |
+| no  | yes | **PULL** | Overwrite local body with remote markdown (rewrite links → relative `.md`). Update `version`, `last_synced`, `body_sha`. |
+| yes | yes | **CONFLICT** | Stop. Show the diff. User picks a side; then PUSH or PULL. Don't auto-merge. |
+
+Also: `id == null` → **CREATE_REMOTE**; remote page whose id is in no local file → **CREATE_LOCAL** (see
+`references/new-pages.md`). Missing `body_sha` → first sync is PULL-authoritative, then write `body_sha`.
+
+`remote_changed` is version-based, so the Markdown round-trip never fabricates a remote change; after a
+PUSH we store the new `version`, so the next run sees `remote_changed = no`.
 
 ## Workflow — full sync (default)
 
-Inputs: a target directory, default `confluence/SD/`.
+Input: a target directory, default `confluence/SD/`.
 
-1. **Walk locally.** Use `Glob` for `confluence/<SPACE>/**/*.md`. For each file: `Read` it, parse the `confluence:` block from the frontmatter, capture `id`, `version`, `body_sha`. Compute the current body sha with the awk pipeline above.
-2. **For each file with an id:** call `getConfluencePage` with `body-format=storage`. Capture `remote.version`, `remote.body`, `remote.lastModified`, `remote.title`.
-3. **Apply the decision matrix.** Group results into PUSH / PULL / CONFLICT / SKIP / CREATE_LOCAL / CREATE_REMOTE buckets. Don't apply anything yet.
-4. **Report the plan** to the user before mutating anything:
+1. **Walk locally.** `Glob` `confluence/<SPACE>/**/*.md`. `Read` each; parse the `confluence:` block; capture
+   `id`, `version`, `body_sha`; compute the current body sha. Build the id↔path map.
+2. **Fetch remotes.** For each file with an id, `getConfluencePage(pageId, contentFormat=markdown)`. Capture
+   `remote.version`, `remote.body`, `remote.title`.
+3. **Classify** into PUSH / PULL / CONFLICT / SKIP / CREATE_LOCAL / CREATE_REMOTE. Don't mutate yet.
+4. **Report the plan** before mutating anything:
 
    ```text
    confluence-sync plan:
      SKIP:  N pages
      PUSH:  M pages
-       - confluence/SD/.../foo.md  (local v5 → remote v6)
-       - ...
+       - confluence/SD/01. Pipeline Architecture.md  (local v12 → remote v12)
      PULL:  K pages
-       - ...
      CONFLICT: J pages (will stop on first)
-       - confluence/SD/.../bar.md  (local v5, remote v7, both edited)
    ```
 
-5. **Apply, in this order, halting on the first error:**
-   - **PULL** first (cheap, can't lose data — the local body is replaced but the source of truth is remote).
-   - **PUSH** second.
-   - **CONFLICT** last — for each, show a diff (`diff` via Bash on two temp files, or render inline) and ask the user to keep local / keep remote / open in editor.
-6. **After each PUSH**, take the new `version` and `last_modified` returned by `updateConfluencePage` and write them back into the file's frontmatter together with the new `body_sha = sha256(body just pushed)`.
-7. **After each PULL**, write the new file (frontmatter + remote body) and set `body_sha = sha256(remote.body)`.
-8. **Report a final tally** in the output contract format below.
+5. **Apply, halting on the first error:** PULL first (can't lose data — remote is source of truth), then
+   PUSH, then CONFLICT (see reference). Re-fetch + re-check `version` immediately before each PUSH; on a 409
+   reclassify as CONFLICT and re-pull.
+6. **After each PUSH**, write back the new `version`/`last_synced` from the response and
+   `body_sha = sha256(local_body)`.
+7. **After each PULL**, write the file (frontmatter + remote body, links rewritten) and
+   `body_sha = sha256(new local_body)`.
+8. **Report** the output contract block below.
 
 ## Workflow — pull-only
 
-Same as full sync, but in step 5, skip PUSH and treat CONFLICT as PULL (remote wins). Use this when you've made out-of-band edits in Confluence and want to pull everything down without examining each conflict.
-
-Don't make this the default — silent overwrite of local edits is a data-loss risk.
+Full sync but skip PUSH and treat CONFLICT as PULL (remote wins). Use after out-of-band Confluence edits.
+Don't make it the default — it silently overwrites local edits.
 
 ## Workflow — push-only
 
-Same as full sync, but skip PULL and treat CONFLICT as PUSH (local wins). Use this when you've made local edits and need them up; you accept overwriting any concurrent Confluence edits.
-
-Same caveat: don't make it the default.
+Full sync but skip PULL and treat CONFLICT as PUSH (local wins). Use when local edits must go up and you
+accept overwriting concurrent Confluence edits. Same caveat.
 
 ## New pages
 
-Two cases — a local file with `confluence.id: null` (`CREATE_REMOTE`), or a remote page with no local mirror (`CREATE_LOCAL`). Both need parent resolution from the directory layout, stable slug rules, and recursion for pages with children. Read **`references/new-pages.md`** for the full procedure when either case appears.
+`CREATE_REMOTE` (a local file with `id: null`) and `CREATE_LOCAL` (a remote page with no local mirror) both
+need parent resolution from the sibling layout and stable filenames. Read **`references/new-pages.md`**.
 
 ## Conflict resolution
 
-When a page lands in the `CONFLICT` bucket (local and remote both moved), follow **`references/conflict-resolution.md`**: print the watermarks, show a `diff`, and let the user pick a side. Never auto-merge. Never silently choose a side.
+When a page lands in `CONFLICT` (both sides moved), follow **`references/conflict-resolution.md`**: print the
+watermarks, show a `diff`, let the user pick a side. Never auto-merge.
+
+## MCP error handling
+
+On **any** error from an Atlassian MCP call (401/403, timeout, connection, "session expired", unexpected
+page-not-found): **stop immediately, do not auto-retry, report it, and ask the user to re-authenticate the
+Atlassian MCP connection.** Wait for confirmation before resuming. Expired sessions are the usual cause.
 
 ## Don't
 
-- Don't update the local frontmatter `version` until the corresponding MCP write has succeeded — otherwise a transient API failure leaves you out of sync.
-- Don't trust `local.version` alone to decide actions — always fetch `getConfluencePage` for the current remote version, even if it feels redundant. The whole point of sync is that remote may have moved since last run.
-- Don't push a page whose body is in a format other than `storage` — pull it fresh with `storage` first.
-- Don't create remote pages whose `parent_id` you can't resolve from the local tree. If you can't find a parent, stop and ask.
+- Don't update local frontmatter `version` until the corresponding MCP write has succeeded.
+- Don't trust `local.version` alone — always fetch the live page, even if it feels redundant.
+- Don't send frontmatter, a leading `# H1`, or relative `.md` links to Confluence.
+- Don't create remote pages whose `parent_id` you can't resolve from the local tree — stop and ask.
+- Don't auto-retry through an MCP error — re-authenticate first.
 
 ## Output contract
 
@@ -165,4 +213,5 @@ CONFLUENCE_SYNC_RESULT:
   status:          SUCCESS | CONFLICT | ERROR
 ```
 
-`status: CONFLICT` if anything went into the conflict bucket and wasn't resolved. `status: ERROR` if any MCP call or write failed. Otherwise `status: SUCCESS`.
+`status: CONFLICT` if anything stayed unresolved in the conflict bucket. `status: ERROR` if any MCP call or
+write failed. Otherwise `SUCCESS`.

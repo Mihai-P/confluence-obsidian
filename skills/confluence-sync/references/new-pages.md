@@ -1,30 +1,53 @@
 # New pages
 
-How to handle pages that exist on only one side. Loaded on demand from `SKILL.md` when a sync surfaces a `CREATE_REMOTE` or `CREATE_LOCAL` case.
+How to handle pages that exist on only one side. Loaded on demand from `SKILL.md` when a sync produces a
+`CREATE_REMOTE` or `CREATE_LOCAL` case. All operations use the MCP with `contentFormat: "markdown"`.
 
-## Local-only (not yet in Confluence)
+## Local-only → CREATE_REMOTE (not yet in Confluence)
 
-A new local file should have `confluence.id: null` and a `parent_id: null` placeholder; everything else inherited from the parent's frontmatter (`space_key`, `space_id`).
+A new local file has `confluence.id: null`; `space_key` / `space_id` are inherited from its parent.
 
-To push:
+1. **Resolve the parent id** from the sibling layout:
+   - A file `confluence/SD/<Foo>/<Child>.md` (inside a folder `<Foo>/`) → parent is the sibling
+     `confluence/SD/<Foo>.md`.
+   - A top-level file `confluence/SD/<Page>.md` → parent is the space home page (`parent_id` of the space
+     root; for SD the home is id `262260`).
+   - The space root itself can't get a new sibling above it — refuse.
 
-1. **Resolve the parent id** from the directory layout:
-   - Leaf file `confluence/SD/<dir>/<slug>.md` → parent is `confluence/SD/<dir>/index.md`.
-   - Branch index `confluence/SD/<dir>/index.md` → parent is `confluence/SD/<parent-dir>/index.md`, walking up.
-   - The space root `confluence/SD/index.md` itself can't have a new sibling above it — refuse.
+   Read the resolved parent file, take `frontmatter.confluence.id` as `parent_id`.
 
-   Read the resolved parent `index.md`, take `frontmatter.confluence.id` as `parent_id`.
+2. **Prepare the body**: strip the frontmatter and the leading `# H1`; rewrite links (see below).
 
-2. **Call `createConfluencePage`** with `spaceId` (from the parent), `parentId`, `title` (from the file's frontmatter), `body` (the file's body), and `body-format=storage`.
+3. **Call `createConfluencePage`** with `spaceId` (from the parent), `parentId`, `title` (from frontmatter),
+   `body` (prepared markdown), and `contentFormat: "markdown"`.
 
-3. **Write the response back** into the local file's frontmatter: `id`, `url`, `parent_id`, `version`, `last_modified`, plus `body_sha = sha256(body that was sent)`. Preserve `title`, `space_key`, `space_id`.
+4. **Write the response back** into the local frontmatter: `id`, `url`, `parent_id`, `version`,
+   `last_synced`, plus `body_sha = sha256(local_body)` (the on-disk body, H1 included). Preserve `title`,
+   `space_key`, `space_id`.
 
-## Remote-only (created in Confluence with no local mirror)
+### Two-pass push for cross-linked new pages
 
-After the per-id loop, list pages in the space with `getPagesInConfluenceSpace(spaceKey)` and look for ids not present in any local file's frontmatter. For each:
+If new local pages link to each other, a link's target may not have an id yet. Push in two passes:
 
-1. Determine the parent — `parentId` on the response. Find the local file with `confluence.id === parentId`. That file's path is the parent location; the new page goes alongside it.
-2. Compute the slug: lowercase the title, collapse non-alphanumeric runs to `-`, trim leading/trailing `-`. On collision in the same parent directory, suffix `--<id>`. Keep these rules stable so existing local slugs continue to match their remote pages.
-3. **If the new page has children** (check via `getConfluencePageDescendants`): create a directory `<slug>/` and write its `index.md`. Then recurse for descendants.
-   **If it's a leaf**: write `<slug>.md`.
-4. Frontmatter is filled from the remote response; `body_sha = sha256(remote.body)`.
+1. **Pass 1** — create every new page (steps 1–4) to allocate ids; write each id/url back to frontmatter.
+   In this pass, drop any link whose target is still unpublished (keep the link text).
+2. **Pass 2** — now that every target has a `confluence.url`, re-render each just-created page with links
+   rewritten to absolute Confluence URLs and `updateConfluencePage` it.
+
+## Remote-only → CREATE_LOCAL (in Confluence, no local mirror)
+
+After the per-id loop, list pages with `getPagesInConfluenceSpace(spaceId)` and find ids not present in any
+local file's frontmatter. For each:
+
+1. **Find the parent location.** Take `parentId` from the page; find the local file whose
+   `confluence.id == parentId`. The new page goes **beside** that parent file:
+   - parent at `confluence/SD/<Foo>.md` → child goes in `confluence/SD/<Foo>/` (create the sibling folder if
+     it doesn't exist yet — this is the leaf→parent promotion).
+   - if the parent is the space home, the child goes at the space root `confluence/SD/`.
+2. **Compute the filename:** the page title with filesystem-illegal characters escaped. On collision in the
+   same folder, suffix `--<id>`. Keep these rules stable so existing local files keep matching their pages.
+3. **Fetch the body** with `getConfluencePage(id, contentFormat=markdown)`; rewrite its links to relative
+   `.md` form. Write the file: frontmatter (filled from the page) + the markdown body (H1 included).
+4. **If the page has children** (check `getConfluencePageDescendants`): it becomes a sibling folder note —
+   write `<Title>.md` and create `<Title>/`, then recurse for descendants. Otherwise write a leaf `<Title>.md`.
+5. Set `body_sha = sha256(local_body)` and `version` from the page.
