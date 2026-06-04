@@ -20,7 +20,8 @@ When you hit a CONFLICT:
    polluted by the watermark.
 
 3. **Ask the user to pick:**
-   - **keep local** → PUSH (strip frontmatter + H1, rewrite links → absolute, `updateConfluencePage`).
+   - **keep local** → PUSH (run the push guard, then strip frontmatter + H1, rewrite links → absolute,
+     `updateConfluencePage`).
    - **keep remote** → PULL (overwrite local body with the remote markdown, rewrite links → relative `.md`).
    - **edit** → open the local file for a manual merge, then re-run sync.
 

@@ -123,7 +123,7 @@ For each local file with a `confluence.id`, fetch the remote with `contentFormat
 | local_changed | remote_changed | Action | What to do |
 | --- | --- | --- | --- |
 | no  | no  | **SKIP** | Nothing to do. |
-| yes | no  | **PUSH** | Strip frontmatter + H1, rewrite links → absolute, `updateConfluencePage`. On success write back `version` (from response), `last_synced`, `body_sha = sha256(local_body)`. |
+| yes | no  | **PUSH** | Run the **push guard** (below). Then strip frontmatter + H1, rewrite links → absolute, `updateConfluencePage`. On success write back `version` (from response), `last_synced`, `body_sha = sha256(local_body)`. |
 | no  | yes | **PULL** | Overwrite local body with remote markdown (rewrite links → relative `.md`). Update `version`, `last_synced`, `body_sha`. |
 | yes | yes | **CONFLICT** | Stop. Show the diff. User picks a side; then PUSH or PULL. Don't auto-merge. |
 
@@ -132,6 +132,26 @@ Also: `id == null` → **CREATE_REMOTE**; remote page whose id is in no local fi
 
 `remote_changed` is version-based, so the Markdown round-trip never fabricates a remote change; after a
 PUSH we store the new `version`, so the next run sees `remote_changed = no`.
+
+## Fidelity & the push guard
+
+Markdown via the MCP is high-fidelity for ordinary content — headings, bold/italic/code, links, nested
+lists, **tables, code blocks (with language), task lists, emoji**, and **inline status / @mentions / smart
+links / dates** (these arrive as `<custom data-type="…" data-id="id-N">…</custom>` placeholder tags and
+round-trip exactly **if left verbatim** — don't mangle them).
+
+But a markdown pull **silently flattens these Confluence-only constructs to plain paragraphs**, and pushing
+the flattened text back makes the loss permanent: **panels** (info/note/warning/success/error),
+**expand/collapse**, **multi-column layouts**, **decision lists**.
+
+**Push guard.** Before any PUSH (including the PUSH side of a resolved CONFLICT), fetch the page once with
+`contentFormat: "html"` and scan for these markers:
+
+- `data-type="panel-` · `<details` · `data-type="layout-` · `data-type="decision-`
+
+If any are present, pushing would flatten them. **Stop, warn the user which constructs would be lost, and
+require explicit confirmation for that page** (or skip it). Pages without these markers push freely. This is
+one extra fetch only for pages that changed locally.
 
 ## Workflow — full sync (default)
 
@@ -193,6 +213,9 @@ Atlassian MCP connection.** Wait for confirmation before resuming. Expired sessi
 - Don't update local frontmatter `version` until the corresponding MCP write has succeeded.
 - Don't trust `local.version` alone — always fetch the live page, even if it feels redundant.
 - Don't send frontmatter, a leading `# H1`, or relative `.md` links to Confluence.
+- Don't PUSH a page that contains panels/expand/layout/decision constructs without running the push guard
+  and getting confirmation — markdown flattens them permanently.
+- Don't rewrite or "tidy" `<custom data-type=… data-id=…>` placeholder tags — they round-trip only verbatim.
 - Don't create remote pages whose `parent_id` you can't resolve from the local tree — stop and ask.
 - Don't auto-retry through an MCP error — re-authenticate first.
 

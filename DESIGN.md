@@ -31,9 +31,28 @@ fidelity is high:
   (§6), because reading and writing the **same format** (Markdown) both directions makes a content hash a
   reliable local-change signal again.
 
-**Residual fidelity risk:** the test page used Markdown-native constructs and manual emoji, not Confluence
-**panels / expand / status / mentions**. Those should be spot-checked on a panel-heavy page before relying
-on them; whatever the MCP's markdown does with them is what we get (we are not preserving them by hand).
+### Fidelity (measured: created a page with every tricky construct, pulled as markdown, pushed back, re-read)
+
+**Round-trips with full fidelity** — safe to sync as markdown:
+
+- Headings, bold/italic/inline code, plain links, nested lists, tables, code blocks (with language), task
+  lists (`- [ ]`/`- [x]`), emoji.
+- **Inline ADF nodes — status (with colour), @mentions (with account-id), smart links, dates.** The MCP
+  encodes these in markdown as placeholder tags, e.g. `<custom data-type="status" data-id="id-0">Done</custom>`,
+  and reconstructs them exactly on push. **Caveat:** they render as raw `<custom>` tags in Obsidian and must
+  be preserved verbatim — editing or deleting a tag loses that node.
+
+**Silently flattened to plain paragraphs on the markdown read — and the loss is permanent once pushed back:**
+
+- ❌ Panels (info/note/warning/success/error) → paragraph
+- ❌ Expand/collapse → title lost, body becomes a paragraph
+- ❌ Multi-column layouts → columns become consecutive paragraphs
+- ❌ Decision lists → paragraph
+
+So markdown sync is high-fidelity for ordinary doc content but **destructive to panels / expands / layouts /
+decision lists** on a pull→push cycle. The skill guards against this (see §6 "Push guard"). The fully
+round-trip-safe alternative is `contentFormat: "html"`, but HTML on disk isn't Obsidian-native, so markdown
+stays the default and we accept the documented losses with a guard rather than silent destruction.
 
 ---
 
@@ -179,6 +198,22 @@ remote change. After our own push, we store the new `version`, so the next run s
 The `.sync/` cache is optional here — used only to show a richer diff on CONFLICT (stash the
 last-synced body per id). It is not required for change detection.
 
+### Push guard — don't silently flatten Confluence-only constructs
+
+A markdown pull already drops panels, expands, multi-column layouts, and decision lists (§1); pushing the
+flattened markdown back makes that loss permanent. So before any **PUSH** (or the PUSH side of a resolved
+CONFLICT), fetch the page once as `contentFormat: "html"` and scan for the markers:
+
+- `data-type="panel-` (info/note/warning/success/error panels)
+- `<details` (expand/collapse)
+- `data-type="layout-` (multi-column layouts)
+- `data-type="decision-` (decision lists)
+
+If any are present, the push would flatten them. **Warn the user and require explicit confirmation per page**
+(or skip it). This costs one extra fetch only for pages that actually changed locally. Pages without these
+markers push freely. Preserve any inline `<custom data-type=… data-id=…>` placeholders verbatim — they
+round-trip correctly only if untouched.
+
 ---
 
 ## 7. New pages, moves, identity
@@ -228,9 +263,12 @@ Per space, one time:
 
 ## 10. Open items
 
-- **Spot-check lossy constructs** (panels, expand, status, mentions, Mermaid/diagram macros) on a
-  panel-heavy page to see what the MCP markdown does with them; decide whether any need special handling.
+- ~~Spot-check lossy constructs~~ **Done** (§1 Fidelity): panels/expand/layouts/decision lists flatten;
+  inline status/mention/smartlink/date round-trip via `<custom>` placeholders. Guard added (§6 Push guard).
+  Still untested: Mermaid/diagram macros and Confluence image/attachment nodes — check when doing attachments.
 - **Attachments**: download-on-pull / upload-on-push and id stability are sketched (§2) but need their own
   pass.
 - **Conflict diff UX**: how much to lean on the optional `.sync/` base for a 3-way-style diff vs. a simple
   local-vs-remote diff.
+- **Inline `<custom>` placeholders in Obsidian**: decide whether to leave them raw (safe, slightly ugly) or
+  prettify on disk and restore on push (nicer, riskier). Default: leave raw.
