@@ -124,6 +124,43 @@ The skill is **manual-only** (`disable-model-invocation: true`) because it write
 - **Claude Code** with the **Atlassian MCP server** connected and authenticated against your Confluence site.
 - A local Markdown mirror under `confluence/<SPACE>/` whose files carry the frontmatter contract above. Files predating the skill that lack `body_sha` are treated as uninitialised: the first sync pulls remote as authoritative, then writes the watermark.
 
+## Example: a first sync
+
+A concrete walkthrough — pulling a Confluence section into a vault for the first time, editing it, and publishing back.
+
+**1. Connect the MCP and install the skill** (see *Requirements* and *Using it* above). Confirm Claude Code can reach your Confluence site.
+
+**2. Pull a page and all its children.** Invoke the skill and tell it what to mirror:
+
+> `/confluence-sync` — pull the "Homelab Security CI" page and all its children from the `Documentat` space into `confluence/Documentat/`
+
+The skill enumerates the page tree (`getPagesInConfluenceSpace` for ids + versions, `getConfluencePageDescendants` for the hierarchy), fetches each page as Markdown, and writes the **sibling folder-note** tree.
+
+**3. What lands on disk** — real, Obsidian-native Markdown with the hierarchy preserved:
+
+```
+confluence/Documentat/
+└── Homelab Security CI.md                 # root page content
+    Homelab Security CI/
+    ├── Architecture & Runner Pool.md
+    ├── Onboarding a Repo.md                # its [[wikilinks]] point at the pages below
+    ├── Pool Setup.md
+    ├── Roadmap & Out of Scope.md
+    └── Workflow Library.md                 # a child that ALSO has children…
+        Workflow Library/                   # …so it gets a sibling folder
+        ├── SAST — Semgrep.md
+        ├── Secrets — Gitleaks + TruffleHog.md
+        └── …                               # one file per workflow
+```
+
+Each file gets frontmatter carrying the page `id`, `version`, and a `body_sha` watermark; internal Confluence links are rewritten to `[[wikilinks]]`; a `/` in a page title is escaped in the filename (`@lhci/cli` → `@lhci-cli`) with the true title preserved as an `aliases` entry so links and search still resolve.
+
+**4. Open the folder in Obsidian.** The folder-note hierarchy renders, wikilinks resolve, and tables / code blocks / callouts / Mermaid display natively.
+
+**5. Edit locally, then publish.** Change any `.md`, then run `/confluence-sync` again. The skill detects `local_changed` (the `body_sha` no longer matches), strips the frontmatter and leading `# H1`, rewrites the wikilinks back to absolute Confluence page URLs, and pushes via `updateConfluencePage` — then writes the new `version` back into the file.
+
+**6. Later syncs are incremental.** Unchanged pages **skip**; pages edited only in Confluence **pull** down; pages edited on both sides **stop and show a diff** so you pick a side. Nothing is auto-merged.
+
 ## Status & roadmap
 
 The skill syncs Confluence ↔ a local, **Obsidian-native** Markdown tree (sibling folder notes, `[[wikilinks]]`, `# H1` titles), so the vault drops straight into **Obsidian**. The full design — Markdown-via-MCP, the sibling layout, the `version` + `body_sha` matrix, link rewriting, and measured fidelity — lives in `DESIGN.md`. Known limitations (documented there): Confluence panels/expand/layouts/decision-lists flatten on a pull→push round-trip (the skill guards pushes), and attachments/images aren't mirrored (the MCP exposes no attachment tools), so v1 is text-only.
