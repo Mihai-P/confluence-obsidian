@@ -2,3 +2,6 @@
 # Local, machine-specific, and rebuildable from a fresh pull — never committed.
 confluence/**/.sync/
 .sync/
+
+# Pulled Confluence vault content (mirror data, not skill source)
+confluence/

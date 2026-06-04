@@ -47,8 +47,9 @@ confluence/SD/
 ```
 
 A leaf is just `Title.md`. When it gains its first child, create the sibling `Title/` folder and write the
-child inside — `Title.md` does not move. Filename = page title, illegal characters escaped; on a title
-collision in the same folder, suffix `--<id>`.
+child inside — `Title.md` does not move. Filename = page title, filesystem-illegal characters escaped
+(notably `/`,`\` → `-`); when the filename differs from the true title, add the true title as an `aliases`
+entry. On a title collision in the same folder, suffix `--<id>`.
 
 ## State stored in frontmatter
 
@@ -73,13 +74,17 @@ remote as authoritative (PULL), then write `body_sha`.
 
 ## Body rules — disk vs. Confluence
 
-- **On disk:** keep the YAML frontmatter and the leading `# H1` (reads as the note title in Obsidian; it
-  equals `frontmatter.title`).
-- **On push:** strip the frontmatter **and** the leading `# H1` before sending — Confluence renders the
-  title itself, so a body H1 would duplicate it.
-- **On pull:** the MCP returns the body with its `# H1`; write it as-is, then add/update frontmatter.
+A leading `# H1` is **not guaranteed** — some pages return markdown starting with `# Title`, others start
+with a paragraph. So:
 
-`body_sha` always hashes the **local** body — everything after the frontmatter, H1 included — so
+- **On disk:** store the body exactly as returned. Keep a leading `# Title` if present; don't synthesise one
+  if absent (the filename is the title).
+- **On push:** strip the frontmatter, and strip the leading `# H1` **only if** the first content line is an
+  H1 whose text equals `frontmatter.title` (else Confluence would show the title twice). Otherwise send the
+  body as-is.
+- **On pull:** write the returned body as-is, then add/update frontmatter.
+
+`body_sha` always hashes the **local** body — everything after the frontmatter, whatever H1 it has — so
 local-change detection is independent of push-time trimming.
 
 ## Computing the local body sha

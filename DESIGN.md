@@ -94,8 +94,12 @@ delete+create).
 sibling `Foo/` folder and write the child inside it — `Foo.md` itself doesn't move. When the last child is
 removed, delete the empty `Foo/` folder.
 
-**Filenames.** Filename = page title with filesystem-illegal characters escaped. On a title collision in
-the same parent folder, suffix `--<id>`. Keep the rule stable so existing files keep matching their pages.
+**Filenames.** Filename = page title with filesystem-illegal characters escaped — notably **`/` and `\` →
+`-`** (real case hit in the e2e: `Lighthouse — @lhci/cli in the Playwright image` → `Lighthouse — @lhci-cli
+in the Playwright image.md`). When the filename differs from the true title, add the true title as an
+Obsidian `aliases` entry (and keep `frontmatter.title` exact) so links and search by the real name still
+resolve. On a title collision in the same parent folder, suffix `--<id>`. Keep these rules stable so
+existing files keep matching their pages.
 
 **Attachments — text-only in v1 (hard MCP constraint).** The Atlassian MCP server exposes **no attachment
 upload/download tools** (confirmed: only page/space/search tools exist), so binaries can't be mirrored
@@ -141,15 +145,19 @@ later to mirror labels / keep links stable on rename.)
 
 The on-disk Markdown is the human-friendly, Obsidian-readable form; the body sent to Confluence is trimmed.
 
-- **On disk:** keep the YAML frontmatter and the leading `# H1` (the H1 reads as the note title in
-  Obsidian and equals `frontmatter.title`).
-- **On push:** strip the frontmatter **and** the leading `# H1` before sending — Confluence renders the
-  page title itself, so an H1 in the body would duplicate it. Send `contentFormat: "markdown"`.
-- **On pull:** the MCP returns the body with its `# H1`; write it as-is (frontmatter is added/updated by
-  the sync).
+**The leading `# H1` is not guaranteed** (observed live): some pages return markdown that starts with
+`# Title`, others start straight into a paragraph — it depends on whether the author put an H1 in the body.
+So:
 
-`body_sha` always hashes the **local** body (frontmatter excluded, H1 included) — the exact bytes stored on
-disk — so local-change detection is independent of the push-time trimming.
+- **On disk:** store the body exactly as the MCP returns it. If it has a leading `# Title`, keep it (reads
+  as the note title in Obsidian); if it doesn't, the filename is the title — don't synthesise one.
+- **On push:** strip the frontmatter, and strip the leading `# H1` **only if** the first content line is an
+  H1 whose text matches `frontmatter.title` (Confluence renders the title itself, so a matching H1 would
+  duplicate it). If there's no such H1, send the body as-is. Send `contentFormat: "markdown"`.
+- **On pull:** write the returned body as-is (frontmatter is added/updated by the sync).
+
+`body_sha` always hashes the **local** body (frontmatter excluded, whatever H1 the body has) — the exact
+bytes stored on disk — so local-change detection is independent of the push-time trimming.
 
 ---
 
