@@ -21,7 +21,28 @@ confluence/<SPACE>/
 └── attachments/<attachment_id>.<ext>
 ```
 
-…the skill walks the tree, compares each file against its live Confluence counterpart, and decides per page whether to **skip, push, pull, or flag a conflict**. Directory layout maps to Confluence parent/child hierarchy as **sibling folder notes**: a page with children is a `Title.md` file beside a `Title/` folder holding those children. (Chosen because the Atlassian MCP's own Markdown links are hierarchy-relative and already assume this layout — see `DESIGN.md`.)
+…the skill walks the tree, compares each file against its live Confluence counterpart, and decides per page whether to **skip, push, pull, or flag a conflict**.
+
+### The Confluence → Obsidian hierarchy problem
+
+The hard part of mirroring Confluence into an Obsidian vault is that **a Confluence page can have *both* its own body content *and* child pages** — but a Markdown file can't contain a folder. So a page that is simultaneously content *and* a parent has nowhere obvious to live on disk.
+
+This skill solves it with **sibling folder notes**: a page with children becomes a `Title.md` file holding that page's content, sitting **beside** a `Title/` folder that holds its children. A leaf page (no children) is just `Title.md`; when it gains its first child, the `Title/` folder is created next to it — the file itself never moves.
+
+```
+confluence/SD/
+├── Architecture.md        ← the "Architecture" page's OWN content
+└── Architecture/          ← its child pages live here
+    ├── API Gateway.md
+    └── Data Model.md
+```
+
+Two alternatives were deliberately rejected:
+
+- **`Architecture/index.md` or `Architecture/README.md`** (page content as a generic file inside its folder) — Obsidian resolves `[[wikilinks]]` by **filename**, vault-wide, so a vault full of identical `index`/`README` notes makes links ambiguous and the graph view unusable.
+- **`Architecture/Architecture.md`** (same-name file inside its own folder) — every internal link would sit one directory deeper than the path the Atlassian MCP emits (its Markdown links are hierarchy-relative and already assume the sibling layout), forcing a full path-rewrite on every link.
+
+The sibling layout keeps filenames unique (clean wikilinks), keeps a page's whole subtree movable as one folder, and lines up with the links the MCP hands back. Full rationale in `DESIGN.md`.
 
 ## How it works
 
