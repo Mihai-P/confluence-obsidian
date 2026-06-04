@@ -1,0 +1,22 @@
+{
+  "name": "confluence-obsidian",
+  "owner": {
+    "name": "Mihai-P",
+    "email": "mihai.petrescu@gmail.com"
+  },
+  "metadata": {
+    "description": "Two-way sync between a local Markdown mirror and an Atlassian Confluence space, via the Atlassian MCP server.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "confluence-sync",
+      "description": "Keeps a local Markdown tree under confluence/<SPACE>/ in two-way sync with a Confluence space: walks the tree, compares each file's frontmatter watermark against the live remote page, and skips, pushes, pulls, or surfaces a conflict per page.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/confluence-sync"
+      ]
+    }
+  ]
+}

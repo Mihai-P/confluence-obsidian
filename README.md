@@ -71,14 +71,32 @@ Pull-only and push-only both silently overwrite one side, so neither is the defa
 ## Repository layout
 
 ```
+.claude-plugin/
+└── marketplace.json          # makes this repo an installable Claude Code marketplace
 skills/
 └── confluence-sync/
-    └── SKILL.md      # the skill definition
+    ├── SKILL.md              # the skill definition (frontmatter + core workflow)
+    └── references/           # progressive-disclosure detail, loaded on demand
+        ├── new-pages.md      # creating pages that exist on only one side
+        └── conflict-resolution.md
+template/
+└── SKILL.md                  # scaffold for authoring a new skill
 ```
 
-This is a standard Claude Code skill directory. Point Claude Code at it (e.g. `--plugin-dir` / a skills path, or copy `skills/confluence-sync/` into your project's `.claude/skills/`) and invoke it with phrases like:
+This mirrors the layout of [`anthropics/skills`](https://github.com/anthropics/skills): a top-level `skills/` directory of self-contained skill folders, a `template/` scaffold, and a `.claude-plugin/` manifest. `SKILL.md` follows the [Agent Skills](https://agentskills.io) open standard and the [Claude Code skills](https://code.claude.com/docs/en/skills) conventions — a `references/` folder holds detail the skill loads only when a task needs it, so it costs no context until then.
 
-> "sync confluence", "pull confluence", "publish to confluence", "is the local mirror up to date", "what changed in confluence"
+### Using it
+
+Either copy `skills/confluence-sync/` into your project's `.claude/skills/` (or `~/.claude/skills/` for all projects), or install the whole repo as a marketplace plugin:
+
+```
+/plugin marketplace add <path-or-git-url-to-this-repo>
+/plugin install confluence-sync@confluence-obsidian
+```
+
+The skill is **manual-only** (`disable-model-invocation: true`) because it writes to live Confluence — invoke it explicitly:
+
+> `/confluence-sync` — then ask to sync, pull, publish, check whether the local mirror is up to date, or see what changed.
 
 ## Requirements
 

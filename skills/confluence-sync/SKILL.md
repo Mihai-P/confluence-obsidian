@@ -1,6 +1,8 @@
 ---
 name: confluence-sync
-description: Two-way sync between local markdown mirror under confluence/<SPACE>/ and the Atlassian Confluence space, using the Atlassian MCP server directly. Walks the local tree, reads version + body_sha from each file's YAML frontmatter, fetches the live remote page via getConfluencePage, and decides per-page whether to skip, push, pull, or surface a conflict. Pushes via updateConfluencePage; creates new pages via createConfluencePage with the parent inferred from directory layout. Triggers on phrases like "sync confluence", "pull confluence", "push the spec", "publish to confluence", "is the local mirror up to date", "what changed in confluence".
+description: Two-way sync between a local markdown mirror under confluence/<SPACE>/ and an Atlassian Confluence space, using the Atlassian MCP server directly. Invoke with /confluence-sync (manual-only — it writes to live Confluence) when you want to publish local edits, pull remote changes, check whether the local mirror is up to date, or see what changed. Walks the local tree, reads version + body_sha from each file's YAML frontmatter, fetches the live remote page via getConfluencePage, and decides per-page whether to skip, push, pull, or surface a conflict. Pushes via updateConfluencePage; creates new pages via createConfluencePage with the parent inferred from directory layout.
+disable-model-invocation: true
+allowed-tools: Read, Write, Edit, Glob, Bash(awk *), Bash(sha256sum *), Bash(diff *), Bash(mkdir *), mcp__claude_ai_Atlassian__getConfluencePage, mcp__claude_ai_Atlassian__updateConfluencePage, mcp__claude_ai_Atlassian__createConfluencePage, mcp__claude_ai_Atlassian__getPagesInConfluenceSpace, mcp__claude_ai_Atlassian__getConfluencePageDescendants
 ---
 
 # confluence-sync
@@ -11,6 +13,13 @@ Two-way sync between `confluence/<SPACE>/` and the Atlassian Confluence space, d
 
 - `confluence/README.md` — the round-trip contract: which frontmatter fields exist, what `confluence.id` is for.
 - The frontmatter at the top of any existing `.md` file under `confluence/SD/` — same shape applies to every page. This skill adds **one new field, `body_sha`**, on top of that shape.
+
+## Reference files
+
+Detailed procedures live beside this file and load only when a sync needs them:
+
+- `references/new-pages.md` — read when the decision matrix produces a `CREATE_REMOTE` (local-only) or `CREATE_LOCAL` (remote-only) case.
+- `references/conflict-resolution.md` — read when a page lands in the `CONFLICT` bucket.
 
 ## State stored in frontmatter
 
@@ -126,50 +135,11 @@ Same caveat: don't make it the default.
 
 ## New pages
 
-### Local-only (not yet in Confluence)
-
-A new local file should have `confluence.id: null` and a `parent_id: null` placeholder; everything else inherited from the parent's frontmatter (`space_key`, `space_id`).
-
-To push:
-
-1. **Resolve the parent id** from the directory layout:
-   - Leaf file `confluence/SD/<dir>/<slug>.md` → parent is `confluence/SD/<dir>/index.md`.
-   - Branch index `confluence/SD/<dir>/index.md` → parent is `confluence/SD/<parent-dir>/index.md`, walking up.
-   - The space root `confluence/SD/index.md` itself can't have a new sibling above it — refuse.
-
-   Read the resolved parent `index.md`, take `frontmatter.confluence.id` as `parent_id`.
-
-2. **Call `createConfluencePage`** with `spaceId` (from the parent), `parentId`, `title` (from the file's frontmatter), `body` (the file's body), and `body-format=storage`.
-
-3. **Write the response back** into the local file's frontmatter: `id`, `url`, `parent_id`, `version`, `last_modified`, plus `body_sha = sha256(body that was sent)`. Preserve `title`, `space_key`, `space_id`.
-
-### Remote-only (created in Confluence with no local mirror)
-
-After the per-id loop, list pages in the space with `getPagesInConfluenceSpace(spaceKey)` and look for ids not present in any local file's frontmatter. For each:
-
-1. Determine the parent — `parentId` on the response. Find the local file with `confluence.id === parentId`. That file's path is the parent location; the new page goes alongside it.
-2. Compute the slug: lowercase the title, collapse non-alphanumeric runs to `-`, trim leading/trailing `-`. On collision in the same parent directory, suffix `--<id>`. Keep these rules stable so existing local slugs continue to match their remote pages.
-3. **If the new page has children** (check via `getConfluencePageDescendants`): create a directory `<slug>/` and write its `index.md`. Then recurse for descendants.
-   **If it's a leaf**: write `<slug>.md`.
-4. Frontmatter is filled from the remote response; `body_sha = sha256(remote.body)`.
+Two cases — a local file with `confluence.id: null` (`CREATE_REMOTE`), or a remote page with no local mirror (`CREATE_LOCAL`). Both need parent resolution from the directory layout, stable slug rules, and recursion for pages with children. Read **`references/new-pages.md`** for the full procedure when either case appears.
 
 ## Conflict resolution
 
-When you hit a CONFLICT (local and remote both moved), do this:
-
-1. Print:
-
-   ```text
-   CONFLICT  <path>
-     local  v<N>  body_sha=<hex8>
-     remote v<M>  body_sha=<hex8>
-   ```
-
-2. Show the diff. Easiest: write `local.body` and `remote.body` to two temp files under `/tmp/confluence-sync/` and run `diff -u` on them, or render the diff inline if it's short.
-3. Ask the user to pick: **keep local** (push), **keep remote** (pull), **edit** (open the local file for the user to merge by hand, then re-run sync).
-4. Whichever side wins, after applying it the frontmatter must end up reflecting the final remote state — `version`, `last_modified`, `body_sha`.
-
-Never auto-merge. Never silently choose a side.
+When a page lands in the `CONFLICT` bucket (local and remote both moved), follow **`references/conflict-resolution.md`**: print the watermarks, show a `diff`, and let the user pick a side. Never auto-merge. Never silently choose a side.
 
 ## Don't
 
