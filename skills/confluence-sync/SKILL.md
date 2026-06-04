@@ -97,34 +97,44 @@ Use that exact incantation so a sha taken right after a `Write` matches a sha ta
 Use `contentFormat: "markdown"` for **both** `getConfluencePage` and `updateConfluencePage`. The MCP server
 does the Confluence↔Markdown conversion. `pageId` is a **string** — pass it quoted.
 
-The MCP renders internal page links as hierarchy-relative paths (`./<ancestor>/<target>`, spaces as `+`, no
-extension, with `#anchors`). Because the layout is sibling, those paths line up with the files.
+**`version` does NOT come from the page read.** `getConfluencePage` (markdown) returns the body but not the
+version number. Get versions from **`getPagesInConfluenceSpace`**, which returns `{ id, title, parentId,
+version.number }` per page in one paginated call — that listing is both the remote-change signal and the
+remote half of the id↔path map. Fetch page **bodies** only for pages that need a pull or a content compare.
 
 ## Links — rewrite both directions
 
-Build an `id → { path, title }` map by scanning every file's frontmatter once per run. Then:
+On disk, internal links are **Obsidian wikilinks** `[[Target Title]]` (or `[[Target Title|display text]]`
+when the text differs). Build an `id → { path, title }` map by scanning every file's frontmatter once per
+run. The MCP emits internal links in **two forms** — handle both:
 
-- **On pull:** rewrite each MCP relative link `./A+B/C#anchor` → an Obsidian relative `.md` link: decode
-  `+`→space, append `.md`, resolve the target via the id↔path map. Keep `http(s)` and `#anchor` links as-is.
-- **On push:** rewrite each relative `.md` link to the **target's absolute Confluence URL**
-  (`confluence.url` from the target file's frontmatter). If the target has no id yet (unpublished), **drop
-  the link, keep the text**. Never send a relative `.md` link to Confluence — it breaks there.
+1. **Absolute by id** — `https://<site>/wiki/spaces/<KEY>/pages/<id>` (the common case; extract `<id>`).
+2. **Relative path** — `./<ancestor>/<target>` with `+`-encoded spaces, no extension, optional `#anchor`.
+
+- **On pull:** resolve each internal link's target id, then look it up in the map:
+  - **in the local mirror** → emit `[[Title]]` (or `[[Title|original text]]`; anchors → `[[Title#Heading]]`).
+  - **not in the mirror** (a page we didn't pull) → **keep the absolute Confluence URL**.
+  - external `http(s)` and bare `#anchor` links pass through unchanged.
+- **On push:** rewrite each `[[Target]]` whose target file has a `confluence.id` to the target's absolute
+  Confluence URL (`confluence.url`). If the target has no id yet, **drop the wikilink, keep the text**. Never
+  send a wikilink or relative `.md` path to Confluence.
 
 For new local pages that link to each other, push in **two passes**: (1) create all new pages to allocate
 ids, writing each id back to frontmatter; (2) re-resolve and rewrite cross-links.
 
 ## Decision matrix
 
-For each local file with a `confluence.id`, fetch the remote with `contentFormat: "markdown"` and compute:
+Get the remote `version` per page from `getPagesInConfluenceSpace` (not from the page read). Then for each
+local file with a `confluence.id`:
 
 - `local_changed  = sha256(local_body) != frontmatter.body_sha`
-- `remote_changed = remote.version != frontmatter.version`
+- `remote_changed = listing[id].version != frontmatter.version`
 
 | local_changed | remote_changed | Action | What to do |
 | --- | --- | --- | --- |
 | no  | no  | **SKIP** | Nothing to do. |
 | yes | no  | **PUSH** | Run the **push guard** (below). Then strip frontmatter + H1, rewrite links → absolute, `updateConfluencePage`. On success write back `version` (from response), `last_synced`, `body_sha = sha256(local_body)`. |
-| no  | yes | **PULL** | Overwrite local body with remote markdown (rewrite links → relative `.md`). Update `version`, `last_synced`, `body_sha`. |
+| no  | yes | **PULL** | Overwrite local body with remote markdown (rewrite links → `[[wikilinks]]`). Update `version`, `last_synced`, `body_sha`. |
 | yes | yes | **CONFLICT** | Stop. Show the diff. User picks a side; then PUSH or PULL. Don't auto-merge. |
 
 Also: `id == null` → **CREATE_REMOTE**; remote page whose id is in no local file → **CREATE_LOCAL** (see
@@ -136,13 +146,19 @@ PUSH we store the new `version`, so the next run sees `remote_changed = no`.
 ## Fidelity & the push guard
 
 Markdown via the MCP is high-fidelity for ordinary content — headings, bold/italic/code, links, nested
-lists, **tables, code blocks (with language), task lists, emoji**, and **inline status / @mentions / smart
-links / dates** (these arrive as `<custom data-type="…" data-id="id-N">…</custom>` placeholder tags and
-round-trip exactly **if left verbatim** — don't mangle them).
+lists, **tables, code blocks (with language), task lists, emoji, blockquotes, Mermaid** (a ` ```mermaid `
+fence round-trips exactly), and **inline status / @mentions / smart links / dates** (these arrive as
+`<custom data-type="…" data-id="id-N">…</custom>` placeholder tags and round-trip exactly **if left
+verbatim** — don't mangle them).
 
 But a markdown pull **silently flattens these Confluence-only constructs to plain paragraphs**, and pushing
 the flattened text back makes the loss permanent: **panels** (info/note/warning/success/error),
 **expand/collapse**, **multi-column layouts**, **decision lists**.
+
+**Attachments / images are text-only in v1.** The MCP has no attachment up/download tools, so binaries
+aren't mirrored. Image refs come back as `![](blob:…&url=<encoded>)` — on pull, best-effort decode the
+`url=` param back to `![](<url>)` for external images and leave Confluence-hosted media as its canonical URL
+(won't render offline). On push, a newly added local image embed can't be uploaded → warn and skip it.
 
 **Push guard.** Before any PUSH (including the PUSH side of a resolved CONFLICT), fetch the page once with
 `contentFormat: "html"` and scan for these markers:
@@ -159,8 +175,10 @@ Input: a target directory, default `confluence/SD/`.
 
 1. **Walk locally.** `Glob` `confluence/<SPACE>/**/*.md`. `Read` each; parse the `confluence:` block; capture
    `id`, `version`, `body_sha`; compute the current body sha. Build the id↔path map.
-2. **Fetch remotes.** For each file with an id, `getConfluencePage(pageId, contentFormat=markdown)`. Capture
-   `remote.version`, `remote.body`, `remote.title`.
+2. **List remotes.** `getPagesInConfluenceSpace(spaceId)` (paginated) → `{ id, title, parentId, version }`
+   per page. This gives `remote.version` for every page and the remote half of the id↔path map. Fetch a page
+   **body** with `getConfluencePage(pageId, contentFormat=markdown)` only when a page needs a PULL or a
+   content compare (CONFLICT) — not for SKIP/PUSH-only decisions.
 3. **Classify** into PUSH / PULL / CONFLICT / SKIP / CREATE_LOCAL / CREATE_REMOTE. Don't mutate yet.
 4. **Report the plan** before mutating anything:
 

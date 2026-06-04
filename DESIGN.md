@@ -36,7 +36,8 @@ fidelity is high:
 **Round-trips with full fidelity** — safe to sync as markdown:
 
 - Headings, bold/italic/inline code, plain links, nested lists, tables, code blocks (with language), task
-  lists (`- [ ]`/`- [x]`), emoji.
+  lists (`- [ ]`/`- [x]`), emoji, blockquotes.
+- **Mermaid** — a ` ```mermaid ` fenced block round-trips exactly and renders natively in Obsidian.
 - **Inline ADF nodes — status (with colour), @mentions (with account-id), smart links, dates.** The MCP
   encodes these in markdown as placeholder tags, e.g. `<custom data-type="status" data-id="id-0">Done</custom>`,
   and reconstructs them exactly on push. **Caveat:** they render as raw `<custom>` tags in Obsidian and must
@@ -96,9 +97,17 @@ removed, delete the empty `Foo/` folder.
 **Filenames.** Filename = page title with filesystem-illegal characters escaped. On a title collision in
 the same parent folder, suffix `--<id>`. Keep the rule stable so existing files keep matching their pages.
 
-**Attachments.** Downloaded into a per-space `attachments/` folder, named by Confluence attachment id
-(globally unique). Referenced from notes as normal Markdown images `![alt](attachments/<id>.png)` (or
-Obsidian embeds `![[<id>.png]]`).
+**Attachments — text-only in v1 (hard MCP constraint).** The Atlassian MCP server exposes **no attachment
+upload/download tools** (confirmed: only page/space/search tools exist), so binaries can't be mirrored
+through it. Worse, the markdown read mangles image refs: an external `![alt](url)` comes back as
+`![](blob:https://media…atl-paas.net/?…&url=<percent-encoded-original>)` — alt text dropped, real URL buried
+in a `url=` param; Confluence-hosted images become opaque media blobs with no fetchable path. So v1:
+- **Does not** download/upload attachment binaries or maintain a local `attachments/` folder.
+- **On pull**, best-effort normalises image refs to something that at least resolves online — decode the
+  `url=` param back to `![](<original-url>)` for external images; for Confluence-hosted media leave the
+  canonical Confluence URL. These won't render offline in Obsidian (documented limitation).
+- **On push**, a newly added local image embed can't be uploaded → warn and skip it (like the panel guard).
+Revisit if/when the MCP gains attachment endpoints, or via a separate REST/browser path (see §10).
 
 ---
 
@@ -144,22 +153,34 @@ disk — so local-change detection is independent of the push-time trimming.
 
 ---
 
-## 5. Links — Obsidian on disk, page links on Confluence
+## 5. Links — Obsidian wikilinks on disk, page links on Confluence
 
-On disk, links are Obsidian-resolvable relative Markdown; the Confluence page-link form exists only
-transiently during a push.
+On disk, internal page links are **Obsidian wikilinks** (`[[Target Title]]`, or `[[Target Title|display]]`
+when the link text differs); the Confluence page-link form exists only transiently during a push. Wikilinks
+were chosen over relative `.md` links after the e2e pull: page titles routinely contain spaces and dots
+(`04.2 Generated-site lifecycle`), which make relative-path links need ugly `%20`/`<…>` escaping, whereas
+wikilinks resolve cleanly by filename. (Trade-off: wikilinks resolve by **filename**, so filenames must be
+unique vault-wide; the `--<id>` collision suffix and an `aliases` entry handle that.)
 
 **The id↔path map.** Each run scans the tree and builds `page_id → { path, title }` from frontmatter. This
 is the source of truth for rewriting both directions and survives renames (identity = id).
 
-- **On pull:** the MCP emits internal links as `./<ancestor>/<target>` with `+`-encoded spaces, no
-  extension, and `#anchors`. Rewrite each to an Obsidian-resolvable relative link: decode `+`→space, append
-  `.md`, and resolve the target via the id↔path map (path comes out right because the layout is sibling).
-  External `http(s)` links and `#anchors` pass through unchanged.
-- **On push:** rewrite each relative `.md` link to the **target page's absolute Confluence URL**
-  (`confluence.url` from the target file's frontmatter); Confluence renders a same-site page URL as a
-  proper page link. If the target has no id yet (unpublished), **drop the link but keep the text** — then
-  publish that page and re-push. Never send a relative `.md` link to Confluence; it breaks there.
+**The MCP emits internal links in two forms** (observed live) — the rewriter must handle both:
+
+1. **Absolute by id:** `https://<site>/wiki/spaces/<KEY>/pages/<id>` — the common case; extract `<id>`.
+2. **Relative path:** `./<ancestor>/<target>` with `+`-encoded spaces, no extension, optional `#anchor`.
+
+- **On pull:** for each internal link, resolve its target page id (case 1: read it directly; case 2:
+  resolve the relative path against the tree). Look the id up in the id↔path map:
+  - **target is in the local mirror** → emit `[[Target Title]]` (or `[[Target Title|original text]]` if the
+    link text differs from the title). Anchors become `[[Target Title#Heading]]`.
+  - **target is NOT in the mirror** (a page we didn't pull, e.g. another subtree) → **keep the absolute
+    Confluence URL** as-is.
+  - external `http(s)` links and bare `#anchors` pass through unchanged.
+- **On push:** rewrite each `[[Target]]` whose target file has a `confluence.id` to the target's absolute
+  Confluence URL (`confluence.url` from its frontmatter); Confluence renders a same-site page URL as a
+  proper page link. If the target has no id yet (unpublished), **drop the wikilink, keep the text** — then
+  publish that page and re-push. Never send a wikilink or a relative `.md` path to Confluence.
 
 **Two-pass push for new pages.** If a link targets a not-yet-published note, push runs in two passes:
 (1) create all new pages to allocate ids, writing each id back to its frontmatter; (2) re-resolve and
@@ -172,10 +193,16 @@ rewrite cross-links now that every target has a `confluence.url`.
 Because we read and write the **same format** (Markdown) both ways, a hash of the body is a reliable
 local-change signal — so we keep the original skill's matrix rather than a shadow-base merge engine.
 
-For each local file with a `confluence.id`, fetch the remote with `contentFormat: "markdown"` and compute:
+**Where `version` comes from (observed live):** `getConfluencePage` with `contentFormat: "markdown"`
+returns the body but **not** the version number. So source versions from **`getPagesInConfluenceSpace`**,
+which returns `{ id, title, parentId, version.number }` per page in one paginated call. That bulk listing is
+both the remote-change signal *and* the remote half of the id↔path map — fetch page **bodies** with
+`getConfluencePage` only for pages that actually need a pull or a content compare.
+
+Then for each local file with a `confluence.id`:
 
 - `local_changed  = sha256(local_body) != frontmatter.body_sha`
-- `remote_changed = remote.version != frontmatter.version`
+- `remote_changed = listing[id].version != frontmatter.version`
 
 | local_changed | remote_changed | Action | What to do |
 | --- | --- | --- | --- |
@@ -263,12 +290,15 @@ Per space, one time:
 
 ## 10. Open items
 
-- ~~Spot-check lossy constructs~~ **Done** (§1 Fidelity): panels/expand/layouts/decision lists flatten;
-  inline status/mention/smartlink/date round-trip via `<custom>` placeholders. Guard added (§6 Push guard).
-  Still untested: Mermaid/diagram macros and Confluence image/attachment nodes — check when doing attachments.
-- **Attachments**: download-on-pull / upload-on-push and id stability are sketched (§2) but need their own
-  pass.
-- **Conflict diff UX**: how much to lean on the optional `.sync/` base for a 3-way-style diff vs. a simple
-  local-vs-remote diff.
-- **Inline `<custom>` placeholders in Obsidian**: decide whether to leave them raw (safe, slightly ugly) or
-  prettify on disk and restore on push (nicer, riskier). Default: leave raw.
+- ~~Spot-check lossy constructs~~ **Done** (§1): panels/expand/layouts/decision lists flatten; inline
+  status/mention/smartlink/date survive via `<custom>` placeholders; **Mermaid** survives. Guard added (§6).
+- ~~Attachments~~ **Resolved as a constraint** (§2): no MCP attachment tools → text-only v1. A future
+  high-fidelity path would need the Confluence REST attachment API directly (outside this MCP) or a
+  Playwright-driven download using the logged-in session — both are separate efforts, not v1.
+- **Conflict diff UX** — *decided*: default to a simple **local-vs-remote** two-way `diff` (both sides are
+  Markdown, so it's readable) and let the user pick a side. The optional `.sync/` base enables a nicer
+  3-way `git merge-file` later, but is not required for v1. CONFLICT never auto-merges.
+- **e2e validated**: pulled `04. Delivery Workflow` + a child into the sibling layout with correct
+  frontmatter, `body_sha`, and wikilink rewriting (in-mirror → `[[…]]`, out-of-mirror id kept absolute).
+- **Inline `<custom>` placeholders in Obsidian**: leave them raw (safe, slightly ugly) for v1; prettify-on-
+  disk + restore-on-push is a possible later nicety.

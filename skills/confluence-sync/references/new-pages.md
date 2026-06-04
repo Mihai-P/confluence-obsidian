@@ -46,8 +46,9 @@ local file's frontmatter. For each:
    - if the parent is the space home, the child goes at the space root `confluence/SD/`.
 2. **Compute the filename:** the page title with filesystem-illegal characters escaped. On collision in the
    same folder, suffix `--<id>`. Keep these rules stable so existing local files keep matching their pages.
-3. **Fetch the body** with `getConfluencePage(id, contentFormat=markdown)`; rewrite its links to relative
-   `.md` form. Write the file: frontmatter (filled from the page) + the markdown body (H1 included).
+3. **Fetch the body** with `getConfluencePage(id, contentFormat=markdown)`; rewrite its internal links to
+   `[[wikilinks]]` (targets outside the mirror keep their absolute Confluence URL). Write the file:
+   frontmatter (filled from the page) + the markdown body (H1 included).
 4. **If the page has children** (check `getConfluencePageDescendants`): it becomes a sibling folder note —
    write `<Title>.md` and create `<Title>/`, then recurse for descendants. Otherwise write a leaf `<Title>.md`.
 5. Set `body_sha = sha256(local_body)` and `version` from the page.

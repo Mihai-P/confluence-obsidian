@@ -58,7 +58,7 @@ On each run, for every page the skill computes:
 
 New local files (`id: null`) are **created** in Confluence with the parent resolved from the folder structure; new remote pages with no local file are **pulled down** into the matching directory. After any write, the frontmatter watermark (`version`, `last_synced`, `body_sha`) is rewritten so the next run can tell exactly what moved.
 
-Bodies are exchanged as **Markdown** via the Atlassian MCP server's server-side conversion (`contentFormat: "markdown"`) — so the files on disk are real, Obsidian-native Markdown, not Confluence XHTML. On disk a page keeps its `# H1` and frontmatter and uses Obsidian-resolvable relative links; on push the skill strips the frontmatter and H1 and rewrites internal links to absolute Confluence page URLs.
+Bodies are exchanged as **Markdown** via the Atlassian MCP server's server-side conversion (`contentFormat: "markdown"`) — so the files on disk are real, Obsidian-native Markdown, not Confluence XHTML. On disk a page keeps its `# H1` and frontmatter and uses Obsidian `[[wikilinks]]` for internal links; on push the skill strips the frontmatter and H1 and rewrites those wikilinks to absolute Confluence page URLs.
 
 ### Modes
 
@@ -105,7 +105,7 @@ The skill is **manual-only** (`disable-model-invocation: true`) because it write
 
 ## Status & roadmap
 
-The skill syncs Confluence ↔ a local, **Obsidian-native** Markdown tree (sibling folder notes, relative links, `# H1` titles), so the vault drops straight into **Obsidian**. The full design — Markdown-via-MCP, the sibling layout, the `version` + `body_sha` matrix, and link rewriting — lives in `DESIGN.md`. Still open: spot-checking how the MCP renders Confluence panels/expand/macros, and attachment (image/file) download-and-upload.
+The skill syncs Confluence ↔ a local, **Obsidian-native** Markdown tree (sibling folder notes, `[[wikilinks]]`, `# H1` titles), so the vault drops straight into **Obsidian**. The full design — Markdown-via-MCP, the sibling layout, the `version` + `body_sha` matrix, link rewriting, and measured fidelity — lives in `DESIGN.md`. Known limitations (documented there): Confluence panels/expand/layouts/decision-lists flatten on a pull→push round-trip (the skill guards pushes), and attachments/images aren't mirrored (the MCP exposes no attachment tools), so v1 is text-only.
 
 ## License
 
