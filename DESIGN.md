@@ -3,277 +3,234 @@
 How the two-way sync works: an **Obsidian-native Markdown vault** on disk, a **Confluence space** on the
 remote, and a sync engine that keeps them in agreement without losing data in either direction.
 
-This document is the contract the `confluence-sync` skill implements. It supersedes the original
-"store Confluence `storage` XHTML in the file body" approach, which round-tripped losslessly but was
-unreadable and unusable in Obsidian — defeating the project's whole purpose.
+This is the contract the `confluence-sync` skill implements. It supersedes the original "store Confluence
+`storage` XHTML in the file body" approach, which round-tripped losslessly but was unreadable and unusable
+in Obsidian — defeating the project's whole purpose.
 
-> Status: agreed design, June 2026. Drives the rewrite of `skills/confluence-sync/`.
-
----
-
-## 1. Goals & non-goals
-
-**Goals**
-
-- On disk, every page is **Obsidian-native Markdown**: wikilinks, embeds, callouts, folder-note hierarchy.
-- **Two-way sync** with safe conflict handling — neither side silently loses edits.
-- **No false conflicts**: editing nothing, or editing only on one side, never reports a spurious conflict.
-- **No silent data loss**: Confluence constructs with no Markdown equivalent (macros, panels, layouts,
-  status, mentions) survive a round-trip.
-
-**Non-goals**
-
-- Real-time sync. This runs on demand (CLI/agent), polling Confluence — not webhooks.
-- Rendering parity. We preserve *content and structure*, not pixel-exact Confluence rendering.
-- Supporting Confluence Server/Data Center first-class. We target **Confluence Cloud** (ADF). Storage
-  format is kept as a fallback path only.
+> Status: agreed design, June 2026. Validated against a working reference (`docs-as-code`, Roo agents) and a
+> live fidelity test on the real SD space.
 
 ---
 
-## 2. On-disk layout
+## 1. Key decision: Markdown via the Atlassian MCP
+
+The Atlassian MCP server converts Confluence content **to and from Markdown server-side**
+(`getConfluencePage` / `updateConfluencePage` with `contentFormat: "markdown"`). We use that directly. This
+is how the working `docs-as-code` setup operates, and a live test on a complex SD page confirmed the
+fidelity is high:
+
+- Tables (including large/complex ones), fenced code blocks, blockquotes, nested lists, bold/italic, and
+  emoji all round-trip cleanly.
+- Internal page links come back as **hierarchy-relative paths** (`./<ancestor title>/<target title>`,
+  spaces as `+`, no `.md`, with `#anchors`); external links stay absolute.
+
+**Consequences — this deletes most of the original complexity:**
+
+- No ADF, no client-side converter (`marklas`/`md2cf`), no `storage` XHTML on disk.
+- No shadow-base three-way merge engine. We reuse the original skill's `version` + `body_sha` matrix
+  (§6), because reading and writing the **same format** (Markdown) both directions makes a content hash a
+  reliable local-change signal again.
+
+**Residual fidelity risk:** the test page used Markdown-native constructs and manual emoji, not Confluence
+**panels / expand / status / mentions**. Those should be spot-checked on a panel-heavy page before relying
+on them; whatever the MCP's markdown does with them is what we get (we are not preserving them by hand).
+
+---
+
+## 2. On-disk layout — sibling folder notes
 
 The vault mirrors the Confluence space tree. A page that has **both content and children** is stored as a
-**same-name folder note**: a folder named after the page, containing a `.md` of the same name for the
-page's own content, with child pages beside it.
+**sibling folder note**: a `.md` file holding the page's own content, **beside** a folder of the same name
+holding its children.
 
 ```
 confluence/<SPACE>/
-├─ <Space Home>.md                 # space root page content (or Home/Home.md if it has children)
-├─ Architecture/
-│  ├─ Architecture.md              # the "Architecture" page's OWN content (folder note)
-│  ├─ API Gateway.md               # a leaf child page
-│  └─ Data Model/
-│     ├─ Data Model.md             # content for a child that ALSO has children
-│     └─ Schemas.md
+├─ 01. Pipeline Architecture.md        # a leaf page (no children)
+├─ 02. Tech Stack Boilerplate.md       # a page WITH children: its own content…
+├─ 02. Tech Stack Boilerplate/         # …and its children in a sibling folder
+│  ├─ 02.5 Generated-site conversion spec.md
+│  └─ …
 ├─ attachments/
-│  └─ <attachment_id>.<ext>        # images/files, named by Confluence attachment id (globally unique)
-└─ .sync/                          # sync state cache (gitignored) — see §6
+│  └─ <attachment_id>.<ext>            # images/files, named by Confluence attachment id
+└─ .sync/                              # optional local cache (gitignored) — see §6
 ```
 
-**Why same-name folder notes** (`Page/Page.md`) and not `index.md`/`README.md`:
+**Why sibling, not `name/name.md` or `name/index.md`:**
 
-- Obsidian resolves `[[wikilinks]]` by **filename**, vault-wide. A vault full of `README.md`/`index.md`
-  files means `[[README]]` is ambiguous and the graph view is noise. Naming the file after the page keeps
-  links unambiguous.
-- A page and its whole subtree live in **one folder** → a remote move/rename is a single atomic local
-  folder move. Good for sync mechanics.
-- It is the most common Obsidian folder-note convention and the default of the Folder Notes plugin
-  (clicking the folder opens its note), so it works for a human vault user with zero config.
+- The MCP's own Markdown links are **hierarchy-relative and assume this exact layout**. A link from
+  `01. Pipeline Architecture.md` to a child of `02. Tech Stack Boilerplate` is emitted as
+  `./02.+Tech+Stack+Boilerplate/02.5+…` — i.e. it expects `02.5` to live *inside a folder beside `01`*.
+  Sibling makes the files line up with the links, so link rewriting is cosmetic (encoding only), not path
+  recomputation. `name/name.md` would put every file one level deeper than its links expect.
+- `index.md` / `README.md` parents are rejected: Obsidian resolves links by **filename**, so a vault full
+  of identical `index`/`README` notes makes links ambiguous and the graph view noise.
+- Matches the proven `docs-as-code` vault.
 
-**Leaf ↔ parent promotion.** A leaf page is just `Leaf.md`. When it gains its first child remotely, the
-sync **promotes** it: `Leaf.md` → `Leaf/Leaf.md`, then writes the child beside it. The reverse (last child
-removed) demotes `Leaf/Leaf.md` → `Leaf.md`. Identity is the page id (frontmatter), so the promotion is a
-move, never a delete+create.
+**Cost of sibling:** a page's content file (`Foo.md`) and its children folder (`Foo/`) are two entries that
+must be renamed/moved together. Minor, and mechanical (identity is the page id, so it's a move, not a
+delete+create).
 
-**Slugs / filenames.** Filename = page title, with filesystem-illegal characters escaped. On a title
-collision within the same parent folder, suffix `--<id>`. Set the original title as an Obsidian `aliases`
-entry so inbound `[[Original Title]]` links survive a filename change.
+**Leaf ↔ parent transition.** A leaf is just `Foo.md`. When it gains its first child remotely, create the
+sibling `Foo/` folder and write the child inside it — `Foo.md` itself doesn't move. When the last child is
+removed, delete the empty `Foo/` folder.
 
-**Attachments.** Downloaded into a per-space `attachments/` folder, named by Confluence attachment id so
-names are globally unique (required for `![[id.png]]` embeds, which also resolve by filename). Referenced
-from notes as Obsidian embeds `![[ <attachment_id>.png ]]`.
+**Filenames.** Filename = page title with filesystem-illegal characters escaped. On a title collision in
+the same parent folder, suffix `--<id>`. Keep the rule stable so existing files keep matching their pages.
+
+**Attachments.** Downloaded into a per-space `attachments/` folder, named by Confluence attachment id
+(globally unique). Referenced from notes as normal Markdown images `![alt](attachments/<id>.png)` (or
+Obsidian embeds `![[<id>.png]]`).
 
 ---
 
 ## 3. Frontmatter (per note)
 
-Frontmatter carries Obsidian-special keys plus the sync **identity + watermark**. Obsidian tolerates
-arbitrary keys and hides them from the rendered note (they appear only in the Properties panel).
+Minimal identity + watermark, namespaced under `confluence:` so it doesn't collide with Obsidian keys.
+Obsidian tolerates arbitrary frontmatter and hides it from the rendered note.
 
 ```yaml
 ---
-aliases: ["Original Confluence Title"]   # keeps inbound [[links]] stable across renames
-tags: [confluence/eng]                    # mirrors Confluence labels (optional)
+title: "01. Pipeline Architecture"
 confluence:
-  id: "458211"                            # canonical page id — the ONLY durable identity
-  url: "https://<site>.atlassian.net/wiki/spaces/ENG/pages/458211"
-  space_key: "ENG"
+  id: "917505"                          # canonical page id — the ONLY durable identity
+  url: "https://xstep.atlassian.net/wiki/spaces/SD/pages/917505"
+  space_key: "SD"
   space_id: "262148"
-  parent_id: "262260"                     # null only for the space root
-  version: 7                              # remote version we last synced TO (authoritative remote signal)
-  last_modified: "2026-06-01T10:22:00Z"
-  format: adf                             # canonical remote format: adf (default) | storage
+  parent_id: "262260"                   # null only for the space root
+  version: 12                           # remote version we last synced TO
+  last_synced: "2026-06-04T10:22:00Z"
+  body_sha: "<sha256 of the local markdown body>"
 ---
 ```
 
-The **full last-synced base bodies** do NOT live in frontmatter (they'd bloat every file). They live in
-the `.sync/` cache (§6). Frontmatter holds identity + version + a content hash only.
+`version` + `body_sha` together describe the last known agreement between local and remote — `version` is
+the authoritative remote-change signal, `body_sha` detects local edits. (`aliases`, `tags` may be added
+later to mirror labels / keep links stable on rename.)
 
 ---
 
-## 4. Canonical remote format: ADF
+## 4. Body rules (disk vs. Confluence)
 
-The Confluence REST API has **no Markdown** representation — all Markdown conversion is client-side. Of the
-writable remote formats, we use **ADF (`atlas_doc_format`, JSON)** as canonical, with **`storage` (XHTML)**
-as a fallback for non-Cloud instances.
+The on-disk Markdown is the human-friendly, Obsidian-readable form; the body sent to Confluence is trimmed.
 
-Why ADF over storage:
+- **On disk:** keep the YAML frontmatter and the leading `# H1` (the H1 reads as the note title in
+  Obsidian and equals `frontmatter.title`).
+- **On push:** strip the frontmatter **and** the leading `# H1` before sending — Confluence renders the
+  page title itself, so an H1 in the body would duplicate it. Send `contentFormat: "markdown"`.
+- **On pull:** the MCP returns the body with its `# H1`; write it as-is (frontmatter is added/updated by
+  the sync).
 
-- ADF is the modern editor's native model; storage is a derived serialization.
-- ADF is a typed JSON tree — every construct (`panel`, `status`, `expand`, `extension`, `mention`,
-  `emoji`, `inlineCard`) is an explicit node, so conversion branches on `node.type` instead of pattern-
-  matching XHTML with custom `ac:`/`ri:` namespaces.
-- ADF canonicalizes deterministically (sort keys, drop volatile ids); storage XHTML does not (attribute
-  order, self-closing style, whitespace, and **volatile `ac:macro-id` UUIDs** all churn the bytes).
-
-ADF bodies are sent on write as a **JSON-encoded string** in `value` (not a raw object).
+`body_sha` always hashes the **local** body (frontmatter excluded, H1 included) — the exact bytes stored on
+disk — so local-change detection is independent of the push-time trimming.
 
 ---
 
-## 5. Conversion (hybrid: deterministic converter + agent)
+## 5. Links — Obsidian on disk, page links on Confluence
 
-Per-page LLM hand-conversion of XHTML/ADF ↔ Markdown is non-deterministic, and that non-determinism is
-exactly what produces false conflicts. So conversion is done by a **pinned, deterministic converter**; the
-agent orchestrates (link rewriting, conflict merges, API calls) but does not hand-convert bodies.
-
-**Converter interface** (whatever tool/script we vendor must expose two deterministic operations):
-
-```
-adf-to-md   <adf.json>  ->  <markdown>     # pull
-md-to-adf   <markdown>  ->  <adf.json>      # push
-```
-
-Reference implementation candidate: **`marklas`** (Python, bidirectional ADF⇄MD, preserves ADF-only
-constructs as namespaced HTML). Battle-tested one-way alternatives: `md2conf` / `mark` (push, storage).
-The converter is swappable behind the two-operation interface above.
-
-**Lossy-construct rule.** Anything with no CommonMark equivalent is **carried through, never dropped** —
-encoded as a namespaced HTML comment or an `adf=`-attributed HTML element that survives Markdown editing.
-A dropped macro is destroyed permanently on the next push, so this is non-negotiable.
-
-| Confluence construct | On-disk Markdown representation |
-| --- | --- |
-| Info / Note / Tip / Warning / Error panel | Obsidian callout `> [!info]` / `[!note]` / `[!tip]` / `[!warning]` / `[!danger]` |
-| Expand / collapse | Foldable callout `> [!note]-` (or `<details><summary>`) |
-| Status lozenge | `<span adf="status" color="green">Done</span>` |
-| Layout / columns | `<div adf="layout">…</div>` fences |
-| Macro / extension (TOC, include, Jira, …) | `<!-- confluence:macro name="toc" params="…" -->` placeholder (regenerated on push) |
-| User mention | `<span adf="mention" account-id="…">@Name</span>` (id preserved — bare `@name` breaks the mention) |
-| Emoji | Unicode passes through; custom emoji keep `shortName` |
-| Table with merged/colored cells | HTML `<table>` (GFM tables lose merges/colors) |
-| Jira / smart link | `inlineCard` URL → `[KEY](url)`; re-promoted to a card on push if the URL matches |
-| Tables / task lists / footnotes / Mermaid | Native Markdown — pass straight through |
-
----
-
-## 6. Sync model: shadow base + three-way merge
-
-Because conversion is lossy and asymmetric, **"hash the body and compare to remote" fires false
-conflicts**. Instead we use the Unison/git **shadow-base** model: keep a copy of the *last-synced state*
-and detect change by comparing **same-format to same-format**, never by re-converting inside the detection
-path.
-
-**State, per page** (`confluence/<SPACE>/.sync/<page_id>/`, gitignored):
-
-```
-.sync/<page_id>/
-├─ base.md          # the Markdown as of the last successful sync
-├─ base.adf.json    # the ADF (or base.storage.xml) as of the last successful sync — the 3-way base
-└─ meta.json        # { version, parent_id, title, md_sha, adf_sha }
-```
-
-**Change detection** (no conversion in this path):
-
-- `local_changed  = canon(current_md) != canon(base.md)`     ← pure same-format compare
-- `remote_changed = remote.version != frontmatter.version`   ← exact, lossless, conversion-free
-
-`version.number` is the authoritative remote signal: it is exact, monotonic, and free (fetched with the
-page). Confluence enforces optimistic locking — a write must send `version + 1` or it 409s — so we also
-**re-fetch and re-check the version immediately before every write**.
-
-**Decision matrix:**
-
-| local_changed | remote_changed | Action |
-| --- | --- | --- |
-| no  | no  | **SKIP** |
-| yes | no  | **PUSH**: `md-to-adf(current_md)` → update with `version+1` → refresh `.sync` base from the write response |
-| no  | yes | **PULL**: `adf-to-md(remote)` → write file → refresh `.sync` base |
-| yes | yes | **3-WAY MERGE** (below) |
-
-**Both changed → three-way merge.** Convert the remote to Markdown, then
-`git merge-file(base.md, current_md, remote_md)`:
-
-- **Clean merge** (edits didn't overlap) → accept, push the merged result, advance the base. This silently
-  resolves the common "we edited different sections" case — the biggest UX win over the old design, which
-  sent *every* both-changed page to manual conflict.
-- **Overlapping edits** → stop, show the 3-way diff, offer **keep local / keep remote / edit markers by
-  hand**. Never auto-pick a side.
-- **False-conflict suppression** (Unison rule): if both changed but `canon(current_md) == canon(remote_md)`,
-  the sides are already in agreement — just advance the base, no conflict.
-
-Merge always happens on **Markdown** (line-oriented, merges well), never on ADF/XHTML.
-
----
-
-## 7. Link rewriting (Obsidian ⇄ Confluence)
-
-On disk links are always Obsidian-native; the Confluence link form exists only transiently during a push.
+On disk, links are Obsidian-resolvable relative Markdown; the Confluence page-link form exists only
+transiently during a push.
 
 **The id↔path map.** Each run scans the tree and builds `page_id → { path, title }` from frontmatter. This
-is the source of truth for rewriting both directions and survives renames (identity = id, not title).
+is the source of truth for rewriting both directions and survives renames (identity = id).
 
-- **Pull**: a Confluence page reference (`<ac:link><ri:page ri:content-id="123456"/></ac:link>`, or an ADF
-  `inlineCard` URL) → look up `123456` → emit `[[Note Title]]` (path-qualified `[[dir/Note|Title]]` on a
-  name collision). Attachment refs → `![[<attachment_id>.ext]]`. External links stay `[text](url)`.
-- **Push**: parse each `[[wikilink]]`, resolve it the way Obsidian does (filename-first), read the target's
-  `confluence.id`, and emit `<ac:link><ri:page ri:content-id="123456"/>…</ac:link>` (use **`content-id`**,
-  not `content-title`, so links survive renames).
+- **On pull:** the MCP emits internal links as `./<ancestor>/<target>` with `+`-encoded spaces, no
+  extension, and `#anchors`. Rewrite each to an Obsidian-resolvable relative link: decode `+`→space, append
+  `.md`, and resolve the target via the id↔path map (path comes out right because the layout is sibling).
+  External `http(s)` links and `#anchors` pass through unchanged.
+- **On push:** rewrite each relative `.md` link to the **target page's absolute Confluence URL**
+  (`confluence.url` from the target file's frontmatter); Confluence renders a same-site page URL as a
+  proper page link. If the target has no id yet (unpublished), **drop the link but keep the text** — then
+  publish that page and re-push. Never send a relative `.md` link to Confluence; it breaks there.
 
-**Two-pass push for new pages.** If a wikilink targets a note with no id yet, push runs in two passes:
+**Two-pass push for new pages.** If a link targets a not-yet-published note, push runs in two passes:
 (1) create all new pages to allocate ids, writing each id back to its frontmatter; (2) re-resolve and
-rewrite cross-links now that every target has an id.
+rewrite cross-links now that every target has a `confluence.url`.
 
 ---
 
-## 8. Moves, renames, identity
+## 6. Sync model — `version` + `body_sha` decision matrix
+
+Because we read and write the **same format** (Markdown) both ways, a hash of the body is a reliable
+local-change signal — so we keep the original skill's matrix rather than a shadow-base merge engine.
+
+For each local file with a `confluence.id`, fetch the remote with `contentFormat: "markdown"` and compute:
+
+- `local_changed  = sha256(local_body) != frontmatter.body_sha`
+- `remote_changed = remote.version != frontmatter.version`
+
+| local_changed | remote_changed | Action | What to do |
+| --- | --- | --- | --- |
+| no  | no  | **SKIP** | Nothing to do. |
+| yes | no  | **PUSH** | Strip frontmatter + H1, rewrite links → absolute, `updateConfluencePage`. On success, write back the new `version` (from the response), `last_synced`, and `body_sha = sha256(local_body)`. |
+| no  | yes | **PULL** | Overwrite local body with the remote markdown (rewrite links → relative `.md`). Update `version`, `last_synced`, `body_sha`. |
+| yes | yes | **CONFLICT** | Stop. Show a diff. Let the user pick a side; then PUSH or PULL. Never auto-merge. |
+
+Plus:
+
+- `confluence.id == null` → **CREATE_REMOTE** (new local page; see new-pages flow).
+- Remote page with no local file holding its id → **CREATE_LOCAL** (pull it down into the right folder).
+- Missing `body_sha` (pre-existing/untracked file) → treat the first sync as PULL-authoritative, then write
+  `body_sha` to initialise tracking.
+
+**Why no false conflicts:** `remote_changed` is version-based (exact, not content-based), so the
+Markdown round-trip (push → Confluence re-renders → next pull may differ in bytes) never fabricates a
+remote change. After our own push, we store the new `version`, so the next run sees `remote_changed = no`.
+
+The `.sync/` cache is optional here — used only to show a richer diff on CONFLICT (stash the
+last-synced body per id). It is not required for change detection.
+
+---
+
+## 7. New pages, moves, identity
 
 Everything keys on **page id**, never path or title.
 
-- **Remote move/rename**: page's `parent_id` or `title` differs from the `.sync` base → move/rename the
-  local file (and its folder, for a folder note) to match; update frontmatter.
-- **Local move**: a file's directory changed but its `confluence.id` is unchanged → push a re-parent.
-  Confluence v2 `PUT` does not reliably re-parent; use the v1 **move endpoint**
-  (`/wiki/rest/api/content/{id}/move/{position}/{targetId}`) for re-parenting, separate from the body
-  update. Title rename is supported on the v2 update.
-- Because identity is the id, a moved file is never mistaken for delete+create.
+- **New local page** (`id: null`): resolve the parent id from the directory layout (the sibling `Foo.md`
+  for a file in `Foo/`, walking up; the space root for top-level files), `createConfluencePage` with that
+  parent, then write the returned `id`/`url`/`version` back to frontmatter.
+- **New remote page** (id not present locally): find the local file whose `id == parentId`; write the new
+  page beside it (as a leaf `Title.md`, or promote to a `Title.md` + `Title/` pair if it has descendants).
+- **Remote move/rename**: `parent_id` or `title` differs from frontmatter → move/rename the local file (and
+  its sibling folder, if any) to match.
+- **Local move**: a file's directory changed but `confluence.id` is unchanged → re-parent on Confluence.
+  (v2 `updateConfluencePage` can change the title; use the v1 move endpoint for re-parenting if needed.)
 
 ---
 
-## 9. Confluence API specifics
+## 8. Confluence / MCP specifics
 
-- **Optimistic locking**: update must send `version.number == current + 1`, else **409**. Re-fetch +
-  version-check immediately before each write; on 409, reclassify as a conflict and re-pull.
-- **Version lag**: trust the version returned *in the update response* when writing the watermark, not an
-  immediate re-GET (replication can briefly lag).
-- **Discovering changes cheaply**: instead of walking the whole space every run, query CQL
-  `space = <KEY> and lastModified > "<watermark>"` to get the changed-since set, then fetch bodies only for
-  those.
-- **Rate limits** (points-based, enforced from March 2026): honor `Retry-After` and `X-RateLimit-*`
-  headers; exponential backoff with jitter on 429.
-- **Body format on the wire**: read/write `atlas_doc_format`; ADF value is a JSON-encoded string. After a
-  write, re-read and re-canonicalize before recording the base — Confluence re-normalizes on save.
-
----
-
-## 10. Migration from the current scheme
-
-The existing skill stores `storage` XHTML in the body with `index.md` parents and a `body_sha` watermark.
-Migration, one space at a time:
-
-1. Pull every page fresh as ADF; convert to Obsidian Markdown; write the new same-name folder-note tree.
-2. Rename `index.md` → `<Folder Name>.md`; rewrite stored Confluence links to `[[wikilinks]]`.
-3. Initialize `.sync/<id>/` bases from the freshly pulled state; drop `body_sha` from frontmatter (now in
-   `.sync/meta.json`).
-4. Treat the first run as PULL-authoritative for any page that lacks a `.sync` base.
+- **Format**: `contentFormat: "markdown"` on both `getConfluencePage` and `updateConfluencePage`.
+- **cloudId**: the site host works directly — `"xstep.atlassian.net"` (cloud id
+  `e059e03c-a728-4f8b-9b40-fbdf8ff31285`). Space `SD` = id `262148`, home page `262260`.
+- **Optimistic locking**: an update must advance `version.number`; a stale version → HTTP 409. Re-fetch and
+  re-check the version immediately before each write; on 409, reclassify as a conflict and re-pull. Trust
+  the version returned in the update **response** when writing the watermark (a quick re-GET can lag).
+- **pageId is a string**; pass it quoted.
+- **Error handling**: on any MCP error (401/403/timeout/etc.), **stop, do not auto-retry, ask the user to
+  re-authenticate** — expired sessions are the common cause (per the docs-as-code rule).
+- **Discovering changes cheaply** on large spaces: CQL `space = SD and lastModified > "<watermark>"` to get
+  the changed-since set instead of walking every page.
 
 ---
 
-## 11. Open items
+## 9. Migration from the current scheme
 
-- **Pick & pin the converter.** `marklas` is the closest bidirectional ADF⇄MD fit; validate fidelity on the
-  real SD space (especially panels, tables, mentions, macros) before committing. Fallback: storage-based
-  `md2conf`/`mark` for push + a dedicated ADF→MD path for pull.
-- **Converter packaging.** Vendored script vs. a pinned pip install — decide how the skill invokes it via
-  `Bash` reproducibly.
-- **Attachment sync** (upload on push, download on pull, id stability) is sketched here but needs its own
+The existing skill stores `storage` XHTML in the body with `index.md` parents and a `body_sha` over XHTML.
+Per space, one time:
+
+1. Pull every page fresh with `contentFormat: "markdown"`; write the sibling folder-note tree (`Title.md`
+   + `Title/`), replacing `index.md`.
+2. Rewrite the MCP's relative links to Obsidian relative `.md` links (§5).
+3. Reset `body_sha` to the sha of the new Markdown body; keep `version` from the remote.
+4. Treat any page lacking a tracked `body_sha` as PULL-authoritative on the first run.
+
+---
+
+## 10. Open items
+
+- **Spot-check lossy constructs** (panels, expand, status, mentions, Mermaid/diagram macros) on a
+  panel-heavy page to see what the MCP markdown does with them; decide whether any need special handling.
+- **Attachments**: download-on-pull / upload-on-push and id stability are sketched (§2) but need their own
   pass.
+- **Conflict diff UX**: how much to lean on the optional `.sync/` base for a 3-way-style diff vs. a simple
+  local-vs-remote diff.
