@@ -1,0 +1,4 @@
+# Sync state cache: full last-synced base bodies + per-page sync metadata.
+# Local, machine-specific, and rebuildable from a fresh pull — never committed.
+confluence/**/.sync/
+.sync/
